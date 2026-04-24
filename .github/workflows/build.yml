@@ -7,7 +7,7 @@ jobs:
       matrix:
         platform: [linux, windows]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: deps
         run: |
           if [ "${{ matrix.platform }}" = "linux" ]; then
@@ -16,14 +16,14 @@ jobs:
             sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
           fi
       - name: build
-        run: |
+        run: | |
           if [ "${{ matrix.platform }}" = "windows" ]; then
             make platform=win CC=x86_64-w64-mingw32-gcc
           else
             make platform=unix
           fi
       - name: upload
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: core-${{ matrix.platform }}
           path: |
