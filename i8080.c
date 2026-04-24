@@ -1,12 +1,14 @@
 #include "i8080.h"
 
 void i8080_reset(i8080* cpu) {
+    if (!cpu) return;
     cpu->pc = 0;
     cpu->sp = 0;
     for(int i = 0; i < 65536; i++) cpu->memory[i] = 0;
 }
 
 void i8080_step(i8080* cpu) {
+    if (!cpu) return;
     uint8_t opcode = cpu->memory[cpu->pc];
     cpu->pc++;
     switch(opcode) {
@@ -16,5 +18,6 @@ void i8080_step(i8080* cpu) {
             cpu->pc = addr;
             break;
         }
+        default: break;
     }
 }
