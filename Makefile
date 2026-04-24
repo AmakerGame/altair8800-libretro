@@ -11,20 +11,26 @@ ifeq ($(platform), unix)
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
    SHARED := -shared
-else
+else ifeq ($(platform), win)
    TARGET := $(TARGET_NAME)_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++
+else ifeq ($(platform), osx)
+   TARGET := $(TARGET_NAME)_libretro.dylib
+   fpic := -fPIC
+   SHARED := -dynamiclib
+   archs = -arch x86_64 -arch arm64
+   CFLAGS += $(archs)
+   LDFLAGS += $(archs)
 endif
 
 CC = gcc
 CFLAGS += $(fpic) -O3 -Wall
-
 OBJECTS = libretro.o i8080.o
 
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CC) $(SHARED) $(CFLAGS) -o $@ $(OBJECTS) -lm
+	$(CC) $(SHARED) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJECTS) -lm
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
