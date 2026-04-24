@@ -1,5 +1,4 @@
 TARGET_NAME = altair8800
-LIBRETRO_DIR = .
 
 ifeq ($(platform),)
 platform = unix
@@ -11,7 +10,7 @@ endif
 ifeq ($(platform), unix)
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
-   SHARED := -shared -Wl,--version-script=link.T
+   SHARED := -shared
 else
    TARGET := $(TARGET_NAME)_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++
