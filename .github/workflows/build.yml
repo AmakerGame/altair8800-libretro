@@ -16,7 +16,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
           fi
       - name: build
-        run: | |
+        run: |
           if [ "${{ matrix.platform }}" = "windows" ]; then
             make platform=win CC=x86_64-w64-mingw32-gcc
           else
