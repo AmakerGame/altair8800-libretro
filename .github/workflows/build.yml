@@ -2,23 +2,33 @@ name: build
 on: [push]
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        platform: [linux, windows]
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: windows
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: deps
+      - name: deps (Linux/Windows)
+        if: runner.os == 'Linux'
         run: |
-          if [ "${{ matrix.platform }}" = "linux" ]; then
-            sudo apt-get update && sudo apt-get install -y build-essential
+          sudo apt-get update
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            sudo apt-get install -y gcc-mingw-w64
           else
-            sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
+            sudo apt-get install -y build-essential
           fi
       - name: build
         run: |
           if [ "${{ matrix.platform }}" = "windows" ]; then
             make platform=win CC=x86_64-w64-mingw32-gcc
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            make platform=osx
           else
             make platform=unix
           fi
@@ -29,3 +39,4 @@ jobs:
           path: |
             *.so
             *.dll
+            *.dylib
