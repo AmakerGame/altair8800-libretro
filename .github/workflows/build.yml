@@ -1,0 +1,31 @@
+name: build
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux, windows]
+    steps:
+      - uses: actions/checkout@v3
+      - name: deps
+        run: |
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            sudo apt-get update && sudo apt-get install -y build-essential
+          else
+            sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
+          fi
+      - name: build
+        run: |
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            make platform=win CC=x86_64-w64-mingw32-gcc
+          else
+            make platform=unix
+          fi
+      - name: upload
+        uses: actions/upload-artifact@v3
+        with:
+          name: core-${{ matrix.platform }}
+          path: |
+            *.so
+            *.dll
