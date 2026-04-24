@@ -1,35 +1,36 @@
 # Altair 8800 Libretro Core
 
-An authentic, lightweight Intel 8080-based emulator core for RetroArch, developed by **Edytor Studio**. This core emulates the legendary Altair 8800, the machine that sparked the personal computer revolution.
+A high-performance Intel 8080-based emulator core for RetroArch, developed by **Edytor Studio**. This core accurately emulates the hardware of the Altair 8800, providing a tactical and visual experience of the early computing era.
 
 ## 🚀 Download
-You can find the latest pre-compiled binaries for Windows, Linux, and macOS here:
+Official binaries for Windows, Linux, and macOS (Universal) are available here:
 👉 **[Latest Releases](https://github.com/AmakerGame/altair8800-libretro/releases)**
 
-## ✨ Features
-* **Multi-Platform Support**: Available for Windows, Linux, and macOS (Universal Binary).
-* **Intel 8080 Emulation**: Accurate instruction set processing at 2MHz.
-* **Front Panel Visualization**: Real-time LED status monitoring directly on the screen.
-* **Lightweight Design**: Minimal dependencies, ensuring compatibility even on legacy hardware like Windows 7.
+## ✨ Key Features
+* **Full Multi-Platform Support**: Seamless operation on Windows, Linux, and macOS.
+* **Accurate CPU Emulation**: Full Intel 8080 instruction set running at 2MHz.
+* **Front Panel Diagnostics**: Real-time visualization of Program Counter (PC) and memory status via simulated LEDs.
+* **Optimized Architecture**: Written in pure C for maximum efficiency and low latency.
 
 ## 🛠️ Installation
 
-1. **Core Placement**: 
-   - Download the version for your OS (e.g., `altair8800-libretro.dll` for Windows).
-   - Move it to your RetroArch `cores` directory.
-2. **Info File**: 
-   - Move `altair8800-libretro.info` to the RetroArch `info` directory to enable proper naming in the menu.
-3. **Running Content**:
-   - Open RetroArch and select **Load Core** -> **Altair 8800**.
-   - Use **Load Content** to open a `.bin` or `.hex` file.
+1. **Core Library**: 
+   - Download the build matching your OS (e.g., `altair8800_libretro.dll` for Windows).
+   - Copy the file to your RetroArch `cores` directory.
+2. **Core Info File**: 
+   - Copy `altair8800_libretro.info` to the RetroArch `info` directory to enable proper system identification.
+3. **Loading Games**:
+   - Open RetroArch, select **Load Core** -> **Altair 8800**.
+   - Use **Load Content** to open `.bin` files.
 
 ## 🎮 Controls (RetroPad)
-* **D-Pad**: Navigate between address/data switches.
-* **Button A**: Toggle the selected switch.
-* **Start**: Toggle RUN/STOP state.
+* **D-Pad**: Navigate between the address/data toggles.
+* **Button A**: Flip the selected switch (ON/OFF).
+* **Start**: Toggle the master RUN/STOP switch.
 
-## 📜 Technical Details
-The core is written in pure C for maximum performance and portability. It utilizes a custom rendering loop to visualize the state of the Program Counter (PC) and memory addresses through simulated LEDs.
+## ⚙️ Technical Specifications
+This core targets the Intel 8080 microprocessor. The rendering engine provides a visual representation of the internal bus state, allowing users to "see" the code executing in real-time, just like on the original 1975 hardware.
 
 ## ⚖️ License
-This project is released under the **MIT License**. Created by Edytor Studio.
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+Created and maintained by **Edytor Studio**.
