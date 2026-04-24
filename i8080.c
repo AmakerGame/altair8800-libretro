@@ -9,15 +9,26 @@ void i8080_reset(i8080* cpu) {
 
 void i8080_step(i8080* cpu) {
     if (!cpu) return;
+    
+    if (cpu->pc >= 65536) {
+        cpu->pc = 0; 
+        return;
+    }
+
     uint8_t opcode = cpu->memory[cpu->pc];
-    cpu->pc++;
+    
     switch(opcode) {
-        case 0x00: break; 
-        case 0xC3: {
-            uint16_t addr = cpu->memory[cpu->pc] | (cpu->memory[cpu->pc+1] << 8);
-            cpu->pc = addr;
+        case 0x00: 
+            cpu->pc++;
+            break;
+        case 0xC3: { // JMP
+            uint16_t low = cpu->memory[(cpu->pc + 1) & 0xFFFF];
+            uint16_t high = cpu->memory[(cpu->pc + 2) & 0xFFFF];
+            cpu->pc = low | (high << 8);
             break;
         }
-        default: break;
+        default:
+            cpu->pc++;
+            break;
     }
 }
