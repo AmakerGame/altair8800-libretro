@@ -27,7 +27,7 @@ void retro_get_system_info(struct retro_system_info *info) {
     info->library_name = "Altair8800";
     info->library_version = "1.0";
     info->need_fullpath = false;
-    info->valid_extensions = "bin";
+    info->valid_extensions = "bin|hex|dsk";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
