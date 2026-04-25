@@ -225,54 +225,47 @@ static void GenerateAudio(void)
    ============================================================= */
 static uint8_t MachineIN(uint8_t port)
 {
-    switch (port) {
-        /* 88-SIO status: bit0=RX ready, bit1=TX empty (always ready) */
-        case 0x00:
-            return (uint8_t)((!term_in_empty() ? 0x01 : 0x00) | 0x02);
-
-        /* 88-SIO data read */
-        case 0x01:
-            return term_pop_in();
-
-        /* Space Invaders ports */
-        case 0x00 + 0: return 0x0e;  /* won't conflict – handled above first */
-        case 0x01:     return si_port1;  /* handled above when SI mode needed */
-        case 0x02:     return si_port2;
-        case 0x03:     return (uint8_t)(shift_reg >> (8 - shift_amount));
-
-        default: return 0xFF;
+    if (panel_mode == MODE_SI) {
+        /* Space Invaders hardware ports */
+        switch (port) {
+            case 0: return 0x0e;
+            case 1: return si_port1;
+            case 2: return si_port2;
+            case 3: return (uint8_t)(shift_reg >> (8 - shift_amount));
+            default: return 0xFF;
+        }
+    } else {
+        /* Altair 8800 / 88-SIO serial card */
+        switch (port) {
+            /* Status: bit0=RX ready, bit1=TX ready (always 1) */
+            case 0x00:
+                return (uint8_t)((!term_in_empty() ? 0x01 : 0x00) | 0x02);
+            /* Data read */
+            case 0x01:
+                return term_pop_in();
+            default: return 0xFF;
+        }
     }
 }
 
 static void MachineOUT(uint8_t port, uint8_t value)
 {
-    switch (port) {
-        /* 88-SIO data write → terminal output buffer */
-        case 0x01:
-            term_push_out(value);
-            break;
-
-        /* SI shift-register amount */
-        case 0x02:
-            shift_amount = value & 0x07;
-            break;
-
-        /* SI sound port 3 – toggle beeper */
-        case 0x03:
-            beeper_on = (value & 0x01) != 0;
-            break;
-
-        /* SI shift-register data */
-        case 0x04:
-            shift_reg = (shift_reg >> 8) | ((uint16_t)value << 8);
-            break;
-
-        /* SI sound port 5 */
-        case 0x05:
-            beeper_on = (value != 0);
-            break;
-
-        default: break;
+    if (panel_mode == MODE_SI) {
+        /* Space Invaders hardware ports */
+        switch (port) {
+            case 2: shift_amount = value & 0x07; break;
+            case 3: beeper_on = (value & 0x01) != 0; break;
+            case 4: shift_reg = (shift_reg >> 8) | ((uint16_t)value << 8); break;
+            case 5: beeper_on = (value != 0); break;
+            default: break;
+        }
+    } else {
+        /* Altair 8800 / 88-SIO */
+        switch (port) {
+            case 0x00: break;                       /* control register – ignore */
+            case 0x01: term_push_out(value); break; /* data write */
+            default: break;
+        }
     }
 }
 
@@ -733,7 +726,7 @@ static void RenderAltairPanel(void)
         /* use simpler even spacing */
         xi = led_x0 + (15 - i) * 47;
         if (xi > FB_W - 20) xi = FB_W - 20;
-        bool on = (led_addr >> i) & 1;
+        bool on = ((led_addr >> i) & 1) != 0;
         DrawLED(xi + 3, led_y + 26, 5, on ? COL_LED_ON : COL_LED_OFF);
     }
 
@@ -749,7 +742,7 @@ static void RenderAltairPanel(void)
     for (int i = 7; i >= 0; i--) {
         int xi = led_x0 + (7 - i) * 47;
         if (xi > FB_W - 20) xi = FB_W - 20;
-        bool on = (led_data >> i) & 1;
+        bool on = ((led_data >> i) & 1) != 0;
         DrawLED(xi + 3, dled_y + 26, 5, on ? COL_LED_ON : COL_LED_OFF);
     }
 
@@ -759,10 +752,10 @@ static void RenderAltairPanel(void)
     /* === Status LEDs row === */
     int stled_y = dled_y + 50;
     const char *stnames[] = {"MEMR","INP","M1","OUT","HLTA","STACK","WO","INTA"};
-    bool stvals[] = {
-        status_leds.memr, status_leds.inp, status_leds.m1,
-        status_leds.out, status_leds.hlta, status_leds.stack,
-        status_leds.wO, status_leds.inta
+    bool stvals[8] = {
+        (bool)status_leds.memr, (bool)status_leds.inp, (bool)status_leds.m1,
+        (bool)status_leds.out,  (bool)status_leds.hlta,(bool)status_leds.stack,
+        (bool)status_leds.wO,   (bool)status_leds.inta
     };
     for (int i = 0; i < 8; i++) {
         int xi = 14 + i * 94;
@@ -776,7 +769,7 @@ static void RenderAltairPanel(void)
     for (int i = 15; i >= 0; i--) {
         int xi = led_x0 + (15 - i) * 47;
         if (xi > FB_W - 20) xi = FB_W - 20;
-        bool bit_on = (sw_addr >> i) & 1;
+        bool bit_on = ((sw_addr >> i) & 1) != 0;
         bool is_cursor = cursor_on_addr && (cursor_addr == i);
 
         uint32_t sw_col = is_cursor ? COL_SW_CURSOR : (bit_on ? COL_SW_UP : COL_SW_DOWN);
@@ -796,7 +789,7 @@ static void RenderAltairPanel(void)
     for (int i = 7; i >= 0; i--) {
         int xi = led_x0 + (7 - i) * 47;
         if (xi > FB_W - 20) xi = FB_W - 20;
-        bool bit_on = (sw_data >> i) & 1;
+        bool bit_on = ((sw_data >> i) & 1) != 0;
         bool is_cursor = !cursor_on_addr && (cursor_data == i);
 
         uint32_t sw_col = is_cursor ? COL_SW_CURSOR : (bit_on ? COL_SW_UP : COL_SW_DOWN);
