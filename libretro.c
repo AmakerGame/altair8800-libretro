@@ -1024,7 +1024,7 @@ void retro_get_system_info(struct retro_system_info *info)
     info->library_name     = "altair8800";
     info->library_version  = "v2.0.0";
     info->need_fullpath    = false;
-    info->valid_extensions = "bin|hex|com|rom";
+    info->valid_extensions = "bin|hex|com|rom|img|8080|tap|cpm|emu|prg|out|ram";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
