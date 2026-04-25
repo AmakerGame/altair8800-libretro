@@ -111,6 +111,90 @@ typedef enum { MODE_ALTAIR = 0, MODE_SI = 1 } PanelMode;
 static PanelMode panel_mode = MODE_ALTAIR;
 
 /* =============================================================
+   Core options (parameters shown in RetroArch Quick Menu)
+   ============================================================= */
+
+/* Option keys */
+#define OPT_CPU_SPEED   "altair8800_cpu_speed"
+#define OPT_PANEL_MODE  "altair8800_panel_mode"
+#define OPT_BEEPER      "altair8800_beeper"
+#define OPT_AUTORUN     "altair8800_autorun"
+#define OPT_STACK_ADDR  "altair8800_stack_addr"
+
+/* Option current values */
+static int  opt_cpu_speed   = 100;   /* % of 2 MHz (50/100/200/400) */
+static bool opt_beeper_en   = true;
+static bool opt_autorun     = false;
+static int  opt_stack_addr  = 0xF000;
+
+static void ApplyCoreOptions(retro_environment_t cb)
+{
+    struct retro_variable var;
+
+    var.key = OPT_CPU_SPEED;
+    var.value = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        if      (!strcmp(var.value, "50"))  opt_cpu_speed = 50;
+        else if (!strcmp(var.value, "100")) opt_cpu_speed = 100;
+        else if (!strcmp(var.value, "200")) opt_cpu_speed = 200;
+        else if (!strcmp(var.value, "400")) opt_cpu_speed = 400;
+        else if (!strcmp(var.value, "800")) opt_cpu_speed = 800;
+    }
+
+    var.key = OPT_PANEL_MODE;
+    var.value = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        if (!strcmp(var.value, "space_invaders"))
+            panel_mode = MODE_SI;
+        else
+            panel_mode = MODE_ALTAIR;
+    }
+
+    var.key = OPT_BEEPER;
+    var.value = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        opt_beeper_en = (strcmp(var.value, "disabled") != 0);
+
+    var.key = OPT_AUTORUN;
+    var.value = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        opt_autorun = (strcmp(var.value, "enabled") == 0);
+
+    var.key = OPT_STACK_ADDR;
+    var.value = NULL;
+    if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        if      (!strcmp(var.value, "0xF000")) opt_stack_addr = 0xF000;
+        else if (!strcmp(var.value, "0xE000")) opt_stack_addr = 0xE000;
+        else if (!strcmp(var.value, "0xD000")) opt_stack_addr = 0xD000;
+        else if (!strcmp(var.value, "0xFF00")) opt_stack_addr = 0xFF00;
+    }
+}
+
+static const struct retro_variable core_options[] = {
+    {
+        OPT_CPU_SPEED,
+        "CPU Speed; 100|50|200|400|800"
+    },
+    {
+        OPT_PANEL_MODE,
+        "Panel Mode (requires reload); altair|space_invaders"
+    },
+    {
+        OPT_BEEPER,
+        "Beeper / Sound; enabled|disabled"
+    },
+    {
+        OPT_AUTORUN,
+        "Auto-Run on Load; disabled|enabled"
+    },
+    {
+        OPT_STACK_ADDR,
+        "Default Stack Pointer; 0xF000|0xE000|0xD000|0xFF00"
+    },
+    { NULL, NULL }   /* sentinel */
+};
+
+/* =============================================================
    Altair 8800 front-panel state
    ============================================================= */
 
@@ -208,7 +292,7 @@ static void GenerateAudio(void)
 
     for (int i = 0; i < SAMPLES_PER_FRAME; i++) {
         int16_t sample = 0;
-        if (beeper_on) {
+        if (beeper_on && opt_beeper_en) {
             sample = (beeper_phase < 3.14159265f) ? 8000 : -8000;
             beeper_phase += step;
             if (beeper_phase >= 2.0f * 3.14159265f)
@@ -275,6 +359,8 @@ static void MachineOUT(uint8_t port, uint8_t value)
 static void RunCycles(int target)
 {
     if (cpu_halted || !panel_running) return;
+    /* Scale cycles by CPU speed option */
+    target = (target * opt_cpu_speed) / 100;
 
     jmp_active = true;
     if (setjmp(cpu_exit_jmp) != 0) {
@@ -457,7 +543,7 @@ static void UpdateAltairInputs(void)
         /* R1: RESET */
         if (just_pressed(cur, prev_buttons, IDX_R)) {
             cpu->pc         = sw_addr;   /* jump to address shown on switches */
-            cpu->sp         = 0xF000;
+            cpu->sp         = (uint16_t)opt_stack_addr;
             cpu->int_enable = 0;
             cpu_halted      = false;
             led_addr = cpu->pc;
@@ -898,6 +984,12 @@ void retro_set_environment(retro_environment_t cb)
 
     bool no_rom = false;
     cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_rom);
+
+    /* Register core options */
+    cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)core_options);
+
+    /* Apply defaults immediately */
+    ApplyCoreOptions(cb);
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb)            { video_cb       = cb; }
@@ -977,6 +1069,19 @@ bool retro_load_game(const struct retro_game_info *game)
         memcpy(cpu->memory, game->data, sz);
     }
 
+    /* Apply current options */
+    if (env_cb) ApplyCoreOptions(env_cb);
+
+    /* Auto-run if option enabled */
+    if (opt_autorun) {
+        panel_running = true;
+        status_leds.run  = true;
+        status_leds.wait = false;
+    }
+
+    /* Apply stack pointer from option */
+    cpu->sp = (uint16_t)opt_stack_addr;
+
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (env_cb) env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
 
@@ -985,6 +1090,11 @@ bool retro_load_game(const struct retro_game_info *game)
 
 void retro_run(void)
 {
+    /* Check if any core option changed this frame */
+    bool updated = false;
+    if (env_cb && env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+        ApplyCoreOptions(env_cb);
+
     if (panel_mode == MODE_SI) {
         UpdateSIInputs();
     } else {
