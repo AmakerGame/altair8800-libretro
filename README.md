@@ -6,6 +6,12 @@ A high-performance Intel 8080-based emulator core for RetroArch, developed by **
 Official binaries for Windows, Linux, and macOS (Universal) are available here:
 👉 **[Latest Releases](https://github.com/AmakerGame/altair8800-libretro/releases/)**
 
+## 📚 Used Repositories
+This project is built using and inspired by the following open-source repositories:
+
+- [Intel 8080 Emulator](https://github.com/nav97/Intel-8080-Emulator) — base implementation of the Intel 8080 CPU emulation.
+- [RetroArch](https://github.com/libretro/RetroArch) — frontend framework and Libretro API integration.
+
 ## ✨ Key Features
 * **Full Multi-Platform Support**: Seamless operation on Windows, Linux, and macOS.
 * **Accurate CPU Emulation**: Full Intel 8080 instruction set running at 2MHz.
