@@ -426,6 +426,15 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
     (void)port; (void)device;
 }
 
+/* Cheat support – not implemented, but the symbols must exist or
+   RetroArch refuses to load the core entirely ("Failed to load
+   symbol: retro_cheat_reset"). */
+void retro_cheat_reset(void) {}
+void retro_cheat_set(unsigned index, bool enabled, const char *code)
+{
+    (void)index; (void)enabled; (void)code;
+}
+
 bool retro_load_game_special(unsigned type,
                               const struct retro_game_info *info,
                               size_t num)
