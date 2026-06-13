@@ -48,14 +48,16 @@
    resolves to our safe stubs.
    ---------------------------------------------------------- */
 static jmp_buf cpu_exit_jmp;
-static bool    cpu_halted = false;
-static bool    jmp_active = false;
+static bool    cpu_halted  = false;
+static bool    jmp_active  = false;
 
 static void safe_exit(int code)
 {
     cpu_halted = true;
-    if (jmp_active)
+    if (jmp_active) {
+        jmp_active = false;   /* FIX: clear BEFORE longjmp so re-entrant calls are safe */
         longjmp(cpu_exit_jmp, code ? code : 1);
+    }
 }
 
 static retro_log_printf_t log_cb = NULL;
@@ -246,6 +248,8 @@ static int      term_out_head = 0;
 static int      term_out_tail = 0;
 
 static inline bool term_in_empty(void)  { return term_in_head  == term_in_tail;  }
+static inline bool term_out_empty(void) { return term_out_head == term_out_tail; }
+/* FIX: correct full-check: (tail+1)%SIZE == head  */
 static inline bool term_out_full(void)  { return ((term_out_tail + 1) % TERM_BUF) == term_out_head; }
 
 static void term_push_in(uint8_t c)
@@ -271,6 +275,7 @@ static void term_push_out(uint8_t c)
         term_out_buf[term_out_tail] = c;
         term_out_tail = (term_out_tail + 1) % TERM_BUF;
     }
+    /* FIX: silently drop char when full instead of corrupting tail */
 }
 
 /* =============================================================
@@ -358,18 +363,21 @@ static void MachineOUT(uint8_t port, uint8_t value)
    ============================================================= */
 static void RunCycles(int target)
 {
-    if (cpu_halted || !panel_running) return;
+    /* FIX: guard against NULL cpu pointer */
+    if (!cpu || cpu_halted || !panel_running) return;
     /* Scale cycles by CPU speed option */
     target = (target * opt_cpu_speed) / 100;
+    if (target <= 0) return;   /* FIX: avoid busy-loop at 0 cycles */
 
     jmp_active = true;
     if (setjmp(cpu_exit_jmp) != 0) {
-        jmp_active = false;
+        /* jmp_active already cleared inside safe_exit before longjmp */
+        jmp_active = false;   /* redundant but safe */
         if (log_cb)
             log_cb(RETRO_LOG_ERROR,
                    "[i8080] Unimplemented instruction at PC=0x%04X – "
                    "CPU halted. Reset to continue.\n",
-                   cpu->pc);
+                   cpu ? cpu->pc : 0xFFFF);
         panel_running = false;
         status_leds.hlta = true;
         return;
@@ -377,7 +385,9 @@ static void RunCycles(int target)
 
     int ran = 0;
     while (ran < target) {
-        uint8_t op = cpu->memory[cpu->pc & 0xFFFF];
+        /* FIX: ensure PC stays within 64KB before every fetch */
+        uint16_t safe_pc = cpu->pc & 0xFFFF;
+        uint8_t op = cpu->memory[safe_pc];
 
         /* Update status LEDs from opcode type */
         status_leds.memr  = true;
@@ -389,24 +399,32 @@ static void RunCycles(int target)
         status_leds.inp   = (op == 0xDB);
 
         if (op == 0xDB) {
-            uint8_t port = cpu->memory[(cpu->pc + 1) & 0xFFFF];
+            /* IN port – operand byte at PC+1, always safe with masking */
+            uint8_t port = cpu->memory[(safe_pc + 1) & 0xFFFF];
             cpu->a  = MachineIN(port);
-            cpu->pc = (cpu->pc + 2) & 0xFFFF;
+            cpu->pc = (safe_pc + 2) & 0xFFFF;
             ran    += 10;
 
         } else if (op == 0xD3) {
-            uint8_t port = cpu->memory[(cpu->pc + 1) & 0xFFFF];
+            /* OUT port */
+            uint8_t port = cpu->memory[(safe_pc + 1) & 0xFFFF];
             MachineOUT(port, cpu->a);
-            cpu->pc = (cpu->pc + 2) & 0xFFFF;
+            cpu->pc = (safe_pc + 2) & 0xFFFF;
             ran    += 10;
 
         } else {
-            ran += Emulate(cpu, false);
+            int cycles = Emulate(cpu, false);
+            /* FIX: Emulate() may return 0 for HLT; avoid infinite loop */
+            if (cycles <= 0) cycles = 4;
+            ran += cycles;
         }
 
         /* Sync panel address/data LEDs to PC and memory under PC */
         led_addr = cpu->pc;
         led_data = cpu->memory[cpu->pc & 0xFFFF];
+
+        /* FIX: bail early if CPU halted inside Emulate() */
+        if (cpu_halted) break;
     }
 
     jmp_active = false;
@@ -424,7 +442,8 @@ static inline bool just_pressed(uint32_t cur, uint32_t prev, unsigned btn)
 
 static void UpdateAltairInputs(void)
 {
-    if (!poll_cb || !input_cb) return;
+    /* FIX: NULL-check cpu before any cpu-> dereference */
+    if (!poll_cb || !input_cb || !cpu) return;
     poll_cb();
 
     uint32_t cur = 0;
@@ -507,7 +526,7 @@ static void UpdateAltairInputs(void)
         /* X: EXAMINE – show memory[sw_addr] on data LEDs */
         if (just_pressed(cur, prev_buttons, IDX_X)) {
             led_addr = sw_addr;
-            led_data = cpu->memory[sw_addr];
+            led_data = cpu->memory[sw_addr & 0xFFFF];   /* FIX: always mask */
             status_leds.memr = true;
             status_leds.wait = true;
         }
@@ -523,7 +542,7 @@ static void UpdateAltairInputs(void)
 
         /* A: DEPOSIT – write sw_data → memory[sw_addr] */
         if (just_pressed(cur, prev_buttons, IDX_A)) {
-            cpu->memory[sw_addr] = sw_data;
+            cpu->memory[sw_addr & 0xFFFF] = sw_data;   /* FIX: always mask */
             led_addr = sw_addr;
             led_data = sw_data;
             status_leds.wO   = true;
@@ -540,14 +559,15 @@ static void UpdateAltairInputs(void)
             status_leds.wait = true;
         }
 
-        /* R1: RESET */
+        /* R1: RESET – jump to address on switches */
         if (just_pressed(cur, prev_buttons, IDX_R)) {
-            cpu->pc         = sw_addr;   /* jump to address shown on switches */
+            cpu->pc         = sw_addr;
             cpu->sp         = (uint16_t)opt_stack_addr;
             cpu->int_enable = 0;
             cpu_halted      = false;
+            jmp_active      = false;   /* FIX: clear crash guard on user reset */
             led_addr = cpu->pc;
-            led_data = cpu->memory[cpu->pc];
+            led_data = cpu->memory[cpu->pc & 0xFFFF];
             status_leds.run  = false;
             status_leds.wait = true;
         }
@@ -597,12 +617,16 @@ static void UpdateSIInputs(void)
 #define COL_RUN_LED     0xFF00FF00
 #define COL_WAIT_LED    0xFFFFFF00
 
+/* FIX: DrawRect with full bounds clamping */
 static void DrawRect(int x, int y, int w, int h, uint32_t col)
 {
-    for (int row = y; row < y + h && row < FB_H; row++)
-        for (int col2 = x; col2 < x + w && col2 < FB_W; col2++)
-            if (row >= 0 && col2 >= 0)
-                frame_buf[row * FB_W + col2] = col;
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + w; if (x1 > FB_W) x1 = FB_W;
+    int y1 = y + h; if (y1 > FB_H) y1 = FB_H;
+    for (int row = y0; row < y1; row++)
+        for (int c = x0; c < x1; c++)
+            frame_buf[row * FB_W + c] = col;
 }
 
 /* Draw a small circle/LED at (cx,cy) with radius r */
@@ -654,10 +678,15 @@ static const uint8_t font3x5[128][5] = {
     ['>'] = {0x04,0x02,0x01,0x02,0x04},
 };
 
+/* FIX: DrawChar guards unknown characters */
 static void DrawChar(int x, int y, char c, uint32_t col, int scale)
 {
-    if ((unsigned char)c >= 128) return;
-    const uint8_t *glyph = font3x5[(unsigned char)c];
+    unsigned char uc = (unsigned char)c;
+    if (uc >= 128) return;
+    const uint8_t *glyph = font3x5[uc];
+    /* Skip if glyph is all zeros (undefined character) */
+    if (!glyph[0] && !glyph[1] && !glyph[2] && !glyph[3] && !glyph[4]
+        && uc != ' ') return;
     for (int row = 0; row < 5; row++) {
         for (int col2 = 0; col2 < 3; col2++) {
             if (glyph[row] & (4 >> col2)) {
@@ -669,9 +698,12 @@ static void DrawChar(int x, int y, char c, uint32_t col, int scale)
 
 static void DrawStr(int x, int y, const char *s, uint32_t col, int scale)
 {
+    if (!s) return;
     while (*s) {
         DrawChar(x, y, *s++, col, scale);
         x += 4 * scale;
+        /* FIX: stop drawing if we've gone past the right edge */
+        if (x >= FB_W) break;
     }
 }
 
@@ -732,19 +764,26 @@ static void term_put_char(uint8_t c)
         return;
     }
     if (c >= 0x20 && c < 0x7F) {
-        term_screen[term_cur_row][term_cur_col++] = (char)c;
+        /* FIX: clamp cursor before write */
+        if (term_cur_row >= TERM_ROWS) {
+            term_scroll();
+        }
         if (term_cur_col >= TERM_COLS) {
             term_cur_col = 0;
             term_cur_row++;
             if (term_cur_row >= TERM_ROWS)
                 term_scroll();
         }
+        term_screen[term_cur_row][term_cur_col++] = (char)c;
     }
+    /* FIX: ignore non-printable chars silently instead of discarding them mid-render */
 }
 
 static void DrainTermOutput(void)
 {
-    while (term_out_head != term_out_tail) {
+    /* FIX: use the same safe accessor as the rest of the ring buffer code */
+    int limit = TERM_BUF; /* max chars per frame to avoid stalling render */
+    while (!term_out_empty() && limit-- > 0) {
         uint8_t c = term_out_buf[term_out_head];
         term_out_head = (term_out_head + 1) % TERM_BUF;
         term_put_char(c);
@@ -767,10 +806,14 @@ static void RenderTerminal(int base_y)
         }
         ty += TERM_CHAR_H;
     }
-    /* Cursor blink */
-    static int blink = 0;
-    if ((blink++ / 30) & 1) {
-        DrawRect(4 + term_cur_col * 5, base_y + 12 + term_cur_row * TERM_CHAR_H,
+    /* FIX: blink counter wrapped to [0,59] range to avoid overflow */
+    static unsigned int blink = 0;
+    blink = (blink + 1) % 60;
+    if ((blink / 30) & 1) {
+        /* FIX: clamp cursor position before using as pixel index */
+        int cc = term_cur_col < TERM_COLS ? term_cur_col : TERM_COLS - 1;
+        int cr = term_cur_row < TERM_ROWS ? term_cur_row : TERM_ROWS - 1;
+        DrawRect(4 + cc * 5, base_y + 12 + cr * TERM_CHAR_H,
                  4, 6, COL_TERM_TEXT);
     }
 }
@@ -780,6 +823,9 @@ static void RenderTerminal(int base_y)
    ------------------------------------------------------- */
 static void RenderAltairPanel(void)
 {
+    /* FIX: guard against NULL cpu – shouldn't happen but be safe */
+    if (!cpu) return;
+
     /* Clear */
     DrawRect(0, 0, FB_W, FB_H, COL_BG);
 
@@ -800,18 +846,18 @@ static void RenderAltairPanel(void)
     DrawStr(sx + 110, sy, "INTE", COL_TEXT_DIM, 1);
     DrawLED(sx + 138, sy + 3, 4, cpu->int_enable ? COL_STATUS_ON : COL_STATUS_OFF);
 
-    /* === Address LEDs (A15–A0) === */
+    /* === Address LEDs (A15–A0) ===
+       FIX: use a fixed spacing that fits 16 LEDs within FB_W-20 pixels.
+       Spacing = (FB_W - 20 - 14) / 16 = 47 px → max x = 14 + 15*47 = 719 ✓ */
     int led_y = 40;
     DrawStr(14, led_y, "ADDRESS", COL_TEXT_DIM, 1);
     DrawStr(14, led_y + 10, "A15                          A0", COL_TEXT_DIM, 1);
 
-    int led_x0 = 14;
-    int led_spacing = 47;
+    const int led_x0      = 14;
+    const int led_spacing = 47;
+
     for (int i = 15; i >= 0; i--) {
-        int xi = led_x0 + (15 - i) * led_spacing / 4;  /* distribute 16 LEDs */
-        /* use simpler even spacing */
-        xi = led_x0 + (15 - i) * 47;
-        if (xi > FB_W - 20) xi = FB_W - 20;
+        int xi = led_x0 + (15 - i) * led_spacing;
         bool on = ((led_addr >> i) & 1) != 0;
         DrawLED(xi + 3, led_y + 26, 5, on ? COL_LED_ON : COL_LED_OFF);
     }
@@ -826,8 +872,7 @@ static void RenderAltairPanel(void)
     DrawStr(14, dled_y + 10, "D7                D0", COL_TEXT_DIM, 1);
 
     for (int i = 7; i >= 0; i--) {
-        int xi = led_x0 + (7 - i) * 47;
-        if (xi > FB_W - 20) xi = FB_W - 20;
+        int xi = led_x0 + (7 - i) * led_spacing;
         bool on = ((led_data >> i) & 1) != 0;
         DrawLED(xi + 3, dled_y + 26, 5, on ? COL_LED_ON : COL_LED_OFF);
     }
@@ -853,8 +898,7 @@ static void RenderAltairPanel(void)
     int sw_y = stled_y + 40;
     DrawStr(14, sw_y - 10, "ADDRESS SWITCHES  (Left/Right to move,  B to flip)", COL_TEXT_DIM, 1);
     for (int i = 15; i >= 0; i--) {
-        int xi = led_x0 + (15 - i) * 47;
-        if (xi > FB_W - 20) xi = FB_W - 20;
+        int xi = led_x0 + (15 - i) * led_spacing;
         bool bit_on = ((sw_addr >> i) & 1) != 0;
         bool is_cursor = cursor_on_addr && (cursor_addr == i);
 
@@ -873,8 +917,7 @@ static void RenderAltairPanel(void)
     int dsw_y = sw_y + 30;
     DrawStr(14, dsw_y - 10, "DATA SWITCHES  (Up/Down to move,  B to flip)", COL_TEXT_DIM, 1);
     for (int i = 7; i >= 0; i--) {
-        int xi = led_x0 + (7 - i) * 47;
-        if (xi > FB_W - 20) xi = FB_W - 20;
+        int xi = led_x0 + (7 - i) * led_spacing;
         bool bit_on = ((sw_data >> i) & 1) != 0;
         bool is_cursor = !cursor_on_addr && (cursor_data == i);
 
@@ -936,25 +979,33 @@ static void RenderAltairPanel(void)
     RenderTerminal(300);
 }
 
-/* Simple Space Invaders VRAM renderer (original behaviour) */
+/* Space Invaders VRAM renderer – FIX: bounds-checked VRAM access */
 static void RenderSI(void)
 {
-    const uint8_t *vram = &cpu->memory[0x2400];
-    for (int i = 0; i < (256 * 256 / 8); i++) {
-        uint8_t byte = vram[i];
-        int px = i * 8;
+    if (!cpu) return;
+    /* Original VRAM starts at 0x2400, size = 256*256/8 = 8192 bytes.
+       Ensure we never read past end of 64KB RAM. */
+    const int vram_start = 0x2400;
+    const int vram_size  = 256 * 256 / 8;
+    /* FIX: clamp vram_size to available memory */
+    const int safe_size  = (vram_start + vram_size <= 0x10000)
+                           ? vram_size
+                           : (0x10000 - vram_start);
+
+    for (int i = 0; i < safe_size; i++) {
+        uint8_t byte = cpu->memory[vram_start + i];
+        int px_base = i * 8;
         for (int bit = 0; bit < 8; bit++) {
-            /* Map 256×256 to 800×480 – scale 3×1 */
-            int sx = (px + bit) % 256;
-            int sy = (px + bit) / 256;
+            int px = px_base + bit;
+            int sx = px % 256;
+            int sy = px / 256;
             int dx = sx * 3;
             int dy = sy * 480 / 256;
+            if (dy >= FB_H || dx + 2 >= FB_W) continue;   /* FIX: skip OOB pixels */
             uint32_t col = (byte & (1 << bit)) ? 0xFFFFFFFF : 0xFF000000;
-            if (dx + 3 <= FB_W && dy < FB_H) {
-                frame_buf[dy * FB_W + dx]     = col;
-                frame_buf[dy * FB_W + dx + 1] = col;
-                frame_buf[dy * FB_W + dx + 2] = col;
-            }
+            frame_buf[dy * FB_W + dx]     = col;
+            frame_buf[dy * FB_W + dx + 1] = col;
+            frame_buf[dy * FB_W + dx + 2] = col;
         }
     }
 }
@@ -1002,6 +1053,7 @@ void retro_init(void)
 {
     cpu        = Init8080();
     cpu_halted = false;
+    jmp_active = false;   /* FIX: explicit init */
     memset(term_screen, ' ', sizeof(term_screen));
     memset(&status_leds, 0, sizeof(status_leds));
     status_leds.wait = true;
@@ -1009,6 +1061,7 @@ void retro_init(void)
 
 void retro_deinit(void)
 {
+    jmp_active = false;   /* FIX: disarm crash guard before freeing CPU */
     if (cpu) {
         free(cpu->memory);
         free(cpu);
@@ -1022,7 +1075,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
     memset(info, 0, sizeof(*info));
     info->library_name     = "altair8800";
-    info->library_version  = "v2.0.0";
+    info->library_version  = "v2.1.0";
     info->need_fullpath    = false;
     info->valid_extensions = "bin|hex|com|rom|img|8080|tap|cpm|emu|prg|out|ram";
 }
@@ -1042,12 +1095,19 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 bool retro_load_game(const struct retro_game_info *game)
 {
     if (!cpu) cpu = Init8080();
+    /* FIX: if Init8080 failed (OOM), bail cleanly */
+    if (!cpu) {
+        if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "[altair8800] Init8080() failed – out of memory\n");
+        return false;
+    }
 
     memset(cpu->memory, 0, 0x10000);
     cpu->pc         = 0;
-    cpu->sp         = 0xF000;
+    cpu->sp         = (uint16_t)opt_stack_addr;   /* FIX: use option, not hardcoded 0xF000 */
     cpu->int_enable = 0;
     cpu_halted      = false;
+    jmp_active      = false;
     panel_running   = false;
 
     sw_addr = 0; sw_data = 0;
@@ -1072,15 +1132,15 @@ bool retro_load_game(const struct retro_game_info *game)
     /* Apply current options */
     if (env_cb) ApplyCoreOptions(env_cb);
 
+    /* Re-apply stack pointer after option parsing */
+    cpu->sp = (uint16_t)opt_stack_addr;
+
     /* Auto-run if option enabled */
     if (opt_autorun) {
         panel_running = true;
         status_leds.run  = true;
         status_leds.wait = false;
     }
-
-    /* Apply stack pointer from option */
-    cpu->sp = (uint16_t)opt_stack_addr;
 
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (env_cb) env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
@@ -1105,14 +1165,14 @@ void retro_run(void)
     RunCycles(CYCLES_PER_HALF);
 
     /* Mid-frame interrupt (RST 1) – used by Space Invaders */
-    if (!cpu_halted && panel_running && cpu->int_enable)
+    if (cpu && !cpu_halted && panel_running && cpu->int_enable)
         GenInterrupt(cpu, 1);
 
     /* Second CPU half */
     RunCycles(CYCLES_PER_HALF);
 
     /* VBlank interrupt (RST 2) */
-    if (!cpu_halted && panel_running && cpu->int_enable)
+    if (cpu && !cpu_halted && panel_running && cpu->int_enable)
         GenInterrupt(cpu, 2);
 
     RenderFrame();
@@ -1124,6 +1184,7 @@ void retro_run(void)
 
 void retro_unload_game(void)
 {
+    jmp_active = false;   /* FIX: disarm before clearing state */
     if (cpu) {
         memset(cpu->memory, 0, 0x10000);
         cpu->pc    = 0;
@@ -1136,14 +1197,17 @@ void retro_reset(void)
 {
     if (cpu) {
         cpu->pc         = 0;
-        cpu->sp         = 0xF000;
+        cpu->sp         = (uint16_t)opt_stack_addr;  /* FIX: use current option */
         cpu->int_enable = 0;
         cpu_halted      = false;
+        jmp_active      = false;   /* FIX: clear crash guard on hard reset */
         panel_running   = false;
         led_addr = 0; led_data = 0;
         si_port1 = 0; si_port2 = 0;
         shift_reg = 0; shift_amount = 0;
         beeper_on = false;
+        term_in_head = term_in_tail = 0;    /* FIX: flush serial buffers on reset */
+        term_out_head = term_out_tail = 0;
         memset(&status_leds, 0, sizeof(status_leds));
         status_leds.wait = true;
     }
@@ -1151,19 +1215,28 @@ void retro_reset(void)
 
 /* =============================================================
    Save states
+   FIX: use explicit flat layout instead of embedding State8080
+        (which contains a pointer and may have platform-specific padding)
    ============================================================= */
 typedef struct {
-    State8080  regs;              /* CPU registers (memory ptr = NULL) */
-    uint16_t   sw_addr;
-    uint8_t    sw_data;
-    uint16_t   led_addr;
-    uint8_t    led_data;
-    bool       panel_running;
-    bool       cpu_halted;
-    uint16_t   shift_reg;
-    uint8_t    shift_amount;
-    uint8_t    si_port1;
-    uint8_t    si_port2;
+    /* CPU registers – stored individually to avoid pointer/padding issues */
+    uint8_t  reg_a, reg_b, reg_c, reg_d, reg_e, reg_h, reg_l;
+    uint16_t reg_sp, reg_pc;
+    uint8_t  reg_int_enable;
+    /* Condition codes */
+    uint8_t  cc_z, cc_s, cc_p, cc_cy, cc_ac;
+    /* Panel state */
+    uint16_t sw_addr;
+    uint8_t  sw_data;
+    uint16_t led_addr;
+    uint8_t  led_data;
+    uint8_t  panel_running;
+    uint8_t  cpu_halted;
+    uint16_t shift_reg;
+    uint8_t  shift_amount;
+    uint8_t  si_port1;
+    uint8_t  si_port2;
+    uint8_t  _pad[2];   /* align to 4 bytes */
     /* 64 KB RAM follows immediately */
 } SaveBlock;
 
@@ -1177,18 +1250,33 @@ bool retro_serialize(void *data, size_t size)
     if (!cpu || size < retro_serialize_size()) return false;
 
     SaveBlock *blk = (SaveBlock *)data;
-    blk->regs          = *cpu;
-    blk->regs.memory   = NULL;
-    blk->sw_addr       = sw_addr;
-    blk->sw_data       = sw_data;
-    blk->led_addr      = led_addr;
-    blk->led_data      = led_data;
-    blk->panel_running = panel_running;
-    blk->cpu_halted    = cpu_halted;
-    blk->shift_reg     = shift_reg;
-    blk->shift_amount  = shift_amount;
-    blk->si_port1      = si_port1;
-    blk->si_port2      = si_port2;
+    memset(blk, 0, sizeof(*blk));
+
+    blk->reg_a          = cpu->a;
+    blk->reg_b          = cpu->b;
+    blk->reg_c          = cpu->c;
+    blk->reg_d          = cpu->d;
+    blk->reg_e          = cpu->e;
+    blk->reg_h          = cpu->h;
+    blk->reg_l          = cpu->l;
+    blk->reg_sp         = cpu->sp;
+    blk->reg_pc         = cpu->pc;
+    blk->reg_int_enable = cpu->int_enable;
+    blk->cc_z           = cpu->cc.z;
+    blk->cc_s           = cpu->cc.s;
+    blk->cc_p           = cpu->cc.p;
+    blk->cc_cy          = cpu->cc.cy;
+    blk->cc_ac          = cpu->cc.ac;
+    blk->sw_addr        = sw_addr;
+    blk->sw_data        = sw_data;
+    blk->led_addr       = led_addr;
+    blk->led_data       = led_data;
+    blk->panel_running  = (uint8_t)panel_running;
+    blk->cpu_halted     = (uint8_t)cpu_halted;
+    blk->shift_reg      = shift_reg;
+    blk->shift_amount   = shift_amount;
+    blk->si_port1       = si_port1;
+    blk->si_port2       = si_port2;
 
     memcpy((uint8_t *)data + sizeof(SaveBlock), cpu->memory, 0x10000);
     return true;
@@ -1199,20 +1287,33 @@ bool retro_unserialize(const void *data, size_t size)
     if (!cpu || size < retro_serialize_size()) return false;
 
     const SaveBlock *blk = (const SaveBlock *)data;
-    uint8_t *mem = cpu->memory;
 
-    *cpu           = blk->regs;
-    cpu->memory    = mem;
-    sw_addr        = blk->sw_addr;
-    sw_data        = blk->sw_data;
-    led_addr       = blk->led_addr;
-    led_data       = blk->led_data;
-    panel_running  = blk->panel_running;
-    cpu_halted     = blk->cpu_halted;
-    shift_reg      = blk->shift_reg;
-    shift_amount   = blk->shift_amount;
-    si_port1       = blk->si_port1;
-    si_port2       = blk->si_port2;
+    cpu->a          = blk->reg_a;
+    cpu->b          = blk->reg_b;
+    cpu->c          = blk->reg_c;
+    cpu->d          = blk->reg_d;
+    cpu->e          = blk->reg_e;
+    cpu->h          = blk->reg_h;
+    cpu->l          = blk->reg_l;
+    cpu->sp         = blk->reg_sp;
+    cpu->pc         = blk->reg_pc;
+    cpu->int_enable = blk->reg_int_enable;
+    cpu->cc.z       = blk->cc_z;
+    cpu->cc.s       = blk->cc_s;
+    cpu->cc.p       = blk->cc_p;
+    cpu->cc.cy      = blk->cc_cy;
+    cpu->cc.ac      = blk->cc_ac;
+    sw_addr         = blk->sw_addr;
+    sw_data         = blk->sw_data;
+    led_addr        = blk->led_addr;
+    led_data        = blk->led_data;
+    panel_running   = (bool)blk->panel_running;
+    cpu_halted      = (bool)blk->cpu_halted;
+    jmp_active      = false;   /* FIX: never restore jmp_active from state */
+    shift_reg       = blk->shift_reg;
+    shift_amount    = blk->shift_amount;
+    si_port1        = blk->si_port1;
+    si_port2        = blk->si_port2;
 
     memcpy(cpu->memory, (const uint8_t *)data + sizeof(SaveBlock), 0x10000);
     return true;
