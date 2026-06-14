@@ -1,6 +1,8 @@
 name: build
-
 on: [push, pull_request]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -18,36 +20,44 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-      - name: deps (Linux / Windows cross)
-        if: runner.os == 'Linux'
+      - name: deps (linux)
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            sudo apt-get install -y gcc-mingw-w64
-          else
-            sudo apt-get install -y build-essential
-          fi
+          sudo apt-get install -y build-essential
 
-      - name: deps (macOS)
-        if: runner.os == 'macOS'
+      - name: deps (windows cross)
+        if: matrix.platform == 'windows'
         run: |
-          xcode-select --print-path || xcode-select --install
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64
 
       - name: build (linux)
         if: matrix.platform == 'linux'
-        run: make platform=unix
+        run: |
+          gcc -fPIC -O2 -Wall -std=c99 -c -o libretro.o libretro.c
+          gcc -fPIC -O2 -Wall -std=c99 -c -o i8080.o i8080.c
+          gcc -shared -fPIC -o altair8800_libretro.so libretro.o i8080.o -lm
 
-      - name: build (windows cross)
+      - name: build (windows)
         if: matrix.platform == 'windows'
-        run: make platform=win CC=x86_64-w64-mingw32-gcc
+        run: |
+          x86_64-w64-mingw32-gcc -O2 -Wall -std=c99 -U_FORTIFY_SOURCE -c -o libretro.o libretro.c
+          x86_64-w64-mingw32-gcc -O2 -Wall -std=c99 -U_FORTIFY_SOURCE -c -o i8080.o i8080.c
+          x86_64-w64-mingw32-gcc -shared -static-libgcc -o altair8800_libretro.dll libretro.o i8080.o -lm
 
       - name: build (macos)
         if: matrix.platform == 'macos'
         shell: bash
-        run: make platform=osx
+        run: |
+          cc -fPIC -O2 -Wall -std=c99 -arch x86_64 -c -o libretro_x86.o libretro.c
+          cc -fPIC -O2 -Wall -std=c99 -arch x86_64 -c -o i8080_x86.o i8080.c
+          cc -fPIC -O2 -Wall -std=c99 -arch arm64  -c -o libretro_arm.o libretro.c
+          cc -fPIC -O2 -Wall -std=c99 -arch arm64  -c -o i8080_arm.o i8080.c
+          cc -dynamiclib -fPIC -arch x86_64 -o altair8800_libretro_x86.dylib libretro_x86.o i8080_x86.o -lm
+          cc -dynamiclib -fPIC -arch arm64  -o altair8800_libretro_arm.dylib libretro_arm.o i8080_arm.o -lm
+          lipo -create -output altair8800_libretro.dylib altair8800_libretro_x86.dylib altair8800_libretro_arm.dylib
 
       - name: upload
         uses: actions/upload-artifact@v4
