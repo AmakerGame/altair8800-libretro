@@ -1,9 +1,12 @@
 name: build
-on: [push]
+
+on: [push, pull_request]
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux
@@ -12,9 +15,13 @@ jobs:
             os: ubuntu-latest
           - platform: macos
             os: macos-latest
+
     steps:
       - uses: actions/checkout@v4
-      - name: deps (Linux/Windows)
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: deps (Linux / Windows cross)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -23,15 +30,25 @@ jobs:
           else
             sudo apt-get install -y build-essential
           fi
-      - name: build
+
+      - name: deps (macOS)
+        if: runner.os == 'macOS'
         run: |
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            make platform=win CC=x86_64-w64-mingw32-gcc
-          elif [ "${{ matrix.platform }}" = "macos" ]; then
-            make platform=osx
-          else
-            make platform=unix
-          fi
+          xcode-select --print-path || xcode-select --install
+
+      - name: build (linux)
+        if: matrix.platform == 'linux'
+        run: make platform=unix
+
+      - name: build (windows cross)
+        if: matrix.platform == 'windows'
+        run: make platform=win CC=x86_64-w64-mingw32-gcc
+
+      - name: build (macos)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: make platform=osx
+
       - name: upload
         uses: actions/upload-artifact@v4
         with:
