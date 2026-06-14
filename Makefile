@@ -12,43 +12,42 @@ endif
 
 # ── Linux / BSD ──────────────────────────────────────────────
 ifeq ($(platform), unix)
-  TARGET  := $(TARGET_NAME)_libretro.so
-  FPIC    := -fPIC
-  SHARED  := -shared -fPIC
+  TARGET := $(TARGET_NAME)_libretro.so
+  CC     ?= gcc
+  CFLAGS  = -fPIC -O2 -Wall -std=c99
+  LFLAGS  = -shared -fPIC
 
-# ── macOS (universal binary x86_64 + arm64) ──────────────────
+# ── macOS (fat binary: x86_64 + arm64) ───────────────────────
 else ifeq ($(platform), osx)
-  TARGET  := $(TARGET_NAME)_libretro.dylib
-  FPIC    := -fPIC
-  SHARED  := -dynamiclib -fPIC
-  ARCHS   := -arch x86_64 -arch arm64
-  CC      := cc
+  TARGET := $(TARGET_NAME)_libretro.dylib
+  CC      = cc
+  CFLAGS  = -fPIC -O2 -Wall -std=c99 -arch x86_64 -arch arm64
+  LFLAGS  = -dynamiclib -fPIC -arch x86_64 -arch arm64
 
-# ── Windows (cross-compile from Linux via mingw) ─────────────
+# ── Windows (mingw cross) ─────────────────────────────────────
 else ifeq ($(platform), win)
-  TARGET  := $(TARGET_NAME)_libretro.dll
-  FPIC    :=
-  SHARED  := -shared -static-libgcc -static-libstdc++
-  CC      ?= x86_64-w64-mingw32-gcc
-  # Disable _FORTIFY_SOURCE: mingw has no __printf_chk
-  EXTRA   := -D_FORTIFY_SOURCE=0 -U_FORTIFY_SOURCE
+  TARGET := $(TARGET_NAME)_libretro.dll
+  CC     ?= x86_64-w64-mingw32-gcc
+  # -U_FORTIFY_SOURCE must come AFTER any -D, so put it last
+  CFLAGS  = -O2 -Wall -std=c99 -U_FORTIFY_SOURCE
+  LFLAGS  = -shared -static-libgcc
+
 endif
 
-CC      ?= gcc
-CFLAGS   = $(FPIC) $(ARCHS) -O2 -Wall -std=c99 $(EXTRA)
-OBJECTS  = libretro.o i8080.o
+OBJECTS = libretro.o i8080.o
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-# Link: only SHARED + ARCHS, no CFLAGS to avoid duplicate -arch
-$(TARGET): $(OBJECTS)
-	$(CC) $(SHARED) $(ARCHS) -o $@ $(OBJECTS) -lm
-
-# Compile each .c separately with full CFLAGS including ARCHS
-%.o: %.c
+libretro.o: libretro.c
 	$(CC) $(CFLAGS) -c -o $@ $
+
+i8080.o: i8080.c
+	$(CC) $(CFLAGS) -c -o $@ $
+
+$(TARGET): $(OBJECTS)
+	$(CC) $(LFLAGS) -o $@ $(OBJECTS) -lm
 
 clean:
 	rm -f $(OBJECTS) $(TARGET)
