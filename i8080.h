@@ -1,3 +1,13 @@
+#ifdef _FORTIFY_SOURCE
+#  undef _FORTIFY_SOURCE
+#endif
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
