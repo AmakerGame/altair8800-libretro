@@ -9,7 +9,7 @@
      - Sound via audio_batch (port 3/5 beeper simulation)
      - EXAMINE / EXAMINE NEXT / DEPOSIT / DEPOSIT NEXT / RUN / STOP
      - Save states (registers + 64 KB RAM)
-     - Crash protection: safe_exit() + setjmp/longjmp guard
+     - HLT handling without terminating the frontend
 
    FRONT PANEL CONTROLS (RetroPad mapping)
    ─────────────────────────────────────────
@@ -17,19 +17,21 @@
    D-Pad Up / Down     – move cursor among the  8 data  toggle switches
    B                   – flip the selected toggle switch (0 ↔ 1)
    A                   – DEPOSIT (write data switches → memory[address])
-   X                   – EXAMINE (load memory[address] → data LEDs)
+   X                   – EXAMINE (PC = address switches, show memory[PC])
    Y                   – DEPOSIT NEXT  (addr++, then DEPOSIT)
    L1                  – EXAMINE NEXT  (addr++, then EXAMINE)
-   R1                  – RESET  (PC = 0, SP = 0xF000)
+   R1                  – RESET  (PC = 0, SP = default stack option)
    Start               – RUN / STOP toggle
-   Select              – switch panel mode: ALTAIR ↔ SI (Space Invaders)
+   Select              – switch panel mode ALTAIR → SI (Space Invaders)
+   L+R+Select (in SI)  – switch back to the ALTAIR panel
+
+   KEYBOARD            – typed characters go to the serial terminal (ALTAIR mode)
 
    TERMINAL (88-SIO serial card)
    ─────────────────────────────
    Port 0x00 – status: bit0=input ready, bit1=output ready (always 1)
    Port 0x01 – data:   read = next char from input ring buffer
                        write = char to terminal output ring buffer
-   The frontend may read terminal output via RETRO_MEMORY_SAVE_RAM.
    ============================================================= */
 
 #include <stdint.h>
@@ -38,49 +40,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <setjmp.h>
 
 #include "libretro.h"
 
-/* ----------------------------------------------------------
-   Crash-protection: redirect exit() and printf() BEFORE
-   i8080.h is included so every reference inside i8080.c
-   resolves to our safe stubs.
-   ---------------------------------------------------------- */
-static jmp_buf cpu_exit_jmp;
-static bool    cpu_halted  = false;
-static bool    jmp_active  = false;
-
-static void safe_exit(int code)
-{
-    cpu_halted = true;
-    if (jmp_active) {
-        jmp_active = false;   /* FIX: clear BEFORE longjmp so re-entrant calls are safe */
-        longjmp(cpu_exit_jmp, code ? code : 1);
-    }
-}
-
 static retro_log_printf_t log_cb = NULL;
 
-static int safe_printf(const char *fmt, ...)
-{
-    if (!log_cb) return 0;
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    log_cb(RETRO_LOG_INFO, "%s", buf);
-    return n;
-}
-
-#define exit(c)      safe_exit(c)
-#define printf(...)  safe_printf(__VA_ARGS__)
-
 #include "i8080.h"
-
-#undef exit
-#undef printf
 
 /* =============================================================
    Display / framebuffer
@@ -110,7 +75,9 @@ static retro_audio_sample_batch_t audio_batch_cb;
    Panel mode
    ============================================================= */
 typedef enum { MODE_ALTAIR = 0, MODE_SI = 1 } PanelMode;
-static PanelMode panel_mode = MODE_ALTAIR;
+static PanelMode panel_mode     = MODE_ALTAIR;
+static PanelMode opt_panel_mode = MODE_ALTAIR;   /* last value seen from core options */
+static bool      panel_running  = false;         /* RUN / STOP (SI mode is always running) */
 
 /* =============================================================
    Core options (parameters shown in RetroArch Quick Menu)
@@ -124,10 +91,20 @@ static PanelMode panel_mode = MODE_ALTAIR;
 #define OPT_STACK_ADDR  "altair8800_stack_addr"
 
 /* Option current values */
-static int  opt_cpu_speed   = 100;   /* % of 2 MHz (50/100/200/400) */
+static int  opt_cpu_speed   = 100;   /* % of 2 MHz (50/100/200/400/800) */
 static bool opt_beeper_en   = true;
 static bool opt_autorun     = false;
 static int  opt_stack_addr  = 0xF000;
+
+static void SetPanelMode(PanelMode m)
+{
+    if (m == panel_mode) return;
+    panel_mode    = m;
+    /* Space Invaders has no RUN/STOP switch, so it starts running;
+       the Altair panel always comes back STOPPED. */
+    panel_running = (m == MODE_SI);
+    if (cpu) cpu->halted = HALT_NONE;
+}
 
 static void ApplyCoreOptions(retro_environment_t cb)
 {
@@ -146,10 +123,12 @@ static void ApplyCoreOptions(retro_environment_t cb)
     var.key = OPT_PANEL_MODE;
     var.value = NULL;
     if (cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (!strcmp(var.value, "space_invaders"))
-            panel_mode = MODE_SI;
-        else
-            panel_mode = MODE_ALTAIR;
+        PanelMode want = !strcmp(var.value, "space_invaders") ? MODE_SI : MODE_ALTAIR;
+        /* only react when the OPTION changes, so the SELECT shortcut isn't undone */
+        if (want != opt_panel_mode) {
+            opt_panel_mode = want;
+            SetPanelMode(want);
+        }
     }
 
     var.key = OPT_BEEPER;
@@ -179,7 +158,7 @@ static const struct retro_variable core_options[] = {
     },
     {
         OPT_PANEL_MODE,
-        "Panel Mode (requires reload); altair|space_invaders"
+        "Panel Mode; altair|space_invaders"
     },
     {
         OPT_BEEPER,
@@ -208,9 +187,6 @@ static uint8_t  sw_data   = 0x00;     /* current data switch state    */
 static int  cursor_addr   = 0;        /* 0-15, LSB first              */
 static int  cursor_data   = 0;        /* 0-7,  LSB first              */
 static bool cursor_on_addr = true;    /* true = addr row selected     */
-
-/* RUN / STOP state */
-static bool panel_running = false;
 
 /* EXAMINE address latch (shown on address LEDs when stopped) */
 static uint16_t led_addr  = 0x0000;
@@ -318,9 +294,9 @@ static uint8_t MachineIN(uint8_t port)
         /* Space Invaders hardware ports */
         switch (port) {
             case 0: return 0x0e;
-            case 1: return si_port1;
+            case 1: return (uint8_t)(si_port1 | 0x08);   /* bit 3 is always 1 */
             case 2: return si_port2;
-            case 3: return (uint8_t)(shift_reg >> (8 - shift_amount));
+            case 3: return (uint8_t)((shift_reg >> (8 - shift_amount)) & 0xFF);
             default: return 0xFF;
         }
     } else {
@@ -359,35 +335,24 @@ static void MachineOUT(uint8_t port, uint8_t value)
 }
 
 /* =============================================================
-   Run CPU cycles with crash guard
+   Run CPU cycles
    ============================================================= */
 static void RunCycles(int target)
 {
-    /* FIX: guard against NULL cpu pointer */
-    if (!cpu || cpu_halted || !panel_running) return;
+    if (!cpu || !panel_running) return;
     /* Scale cycles by CPU speed option */
     target = (target * opt_cpu_speed) / 100;
-    if (target <= 0) return;   /* FIX: avoid busy-loop at 0 cycles */
-
-    jmp_active = true;
-    if (setjmp(cpu_exit_jmp) != 0) {
-        /* jmp_active already cleared inside safe_exit before longjmp */
-        jmp_active = false;   /* redundant but safe */
-        if (log_cb)
-            log_cb(RETRO_LOG_ERROR,
-                   "[i8080] Unimplemented instruction at PC=0x%04X – "
-                   "CPU halted. Reset to continue.\n",
-                   cpu ? cpu->pc : 0xFFFF);
-        panel_running = false;
-        status_leds.hlta = true;
-        return;
-    }
+    if (target <= 0) return;
 
     int ran = 0;
     while (ran < target) {
-        /* FIX: ensure PC stays within 64KB before every fetch */
-        uint16_t safe_pc = cpu->pc & 0xFFFF;
-        uint8_t op = cpu->memory[safe_pc];
+        if (cpu->halted) {            /* HLT: idle until interrupt / START / RESET */
+            status_leds.hlta = true;
+            status_leds.run  = false;
+            break;
+        }
+
+        uint8_t op = cpu->memory[cpu->pc];
 
         /* Update status LEDs from opcode type */
         status_leds.memr  = true;
@@ -398,36 +363,15 @@ static void RunCycles(int target)
         status_leds.out   = (op == 0xD3);
         status_leds.inp   = (op == 0xDB);
 
-        if (op == 0xDB) {
-            /* IN port – operand byte at PC+1, always safe with masking */
-            uint8_t port = cpu->memory[(safe_pc + 1) & 0xFFFF];
-            cpu->a  = MachineIN(port);
-            cpu->pc = (safe_pc + 2) & 0xFFFF;
-            ran    += 10;
-
-        } else if (op == 0xD3) {
-            /* OUT port */
-            uint8_t port = cpu->memory[(safe_pc + 1) & 0xFFFF];
-            MachineOUT(port, cpu->a);
-            cpu->pc = (safe_pc + 2) & 0xFFFF;
-            ran    += 10;
-
-        } else {
-            int cycles = Emulate(cpu, false);
-            /* FIX: Emulate() may return 0 for HLT; avoid infinite loop */
-            if (cycles <= 0) cycles = 4;
-            ran += cycles;
-        }
+        /* IN / OUT are routed through cpu->io_in / cpu->io_out */
+        int cycles = Emulate(cpu, false);
+        if (cycles <= 0) cycles = 4;
+        ran += cycles;
 
         /* Sync panel address/data LEDs to PC and memory under PC */
         led_addr = cpu->pc;
-        led_data = cpu->memory[cpu->pc & 0xFFFF];
-
-        /* FIX: bail early if CPU halted inside Emulate() */
-        if (cpu_halted) break;
+        led_data = cpu->memory[cpu->pc];
     }
-
-    jmp_active = false;
 }
 
 /* =============================================================
@@ -440,14 +384,22 @@ static inline bool just_pressed(uint32_t cur, uint32_t prev, unsigned btn)
     return (cur & (1u << btn)) && !(prev & (1u << btn));
 }
 
-static void UpdateAltairInputs(void)
-{
-    /* FIX: NULL-check cpu before any cpu-> dereference */
-    if (!poll_cb || !input_cb || !cpu) return;
-    poll_cb();
+/* Indices into the bitmask built by ReadButtons() */
+#define IDX_B      0
+#define IDX_Y      1
+#define IDX_SELECT 2
+#define IDX_START  3
+#define IDX_UP     4
+#define IDX_DOWN   5
+#define IDX_LEFT   6
+#define IDX_RIGHT  7
+#define IDX_A      8
+#define IDX_X      9
+#define IDX_L      10
+#define IDX_R      11
 
-    uint32_t cur = 0;
-    /* Read all RetroPad buttons into a bitmask */
+static uint32_t ReadButtons(void)
+{
     static const unsigned ids[] = {
         RETRO_DEVICE_ID_JOYPAD_B,
         RETRO_DEVICE_ID_JOYPAD_Y,
@@ -462,35 +414,28 @@ static void UpdateAltairInputs(void)
         RETRO_DEVICE_ID_JOYPAD_L,
         RETRO_DEVICE_ID_JOYPAD_R,
     };
+    uint32_t cur = 0;
     for (unsigned i = 0; i < sizeof(ids)/sizeof(ids[0]); i++)
         if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, ids[i]))
             cur |= (1u << i);
+    return cur;
+}
 
-    /* Map bitmask indices to button IDs */
-#define IDX_B      0
-#define IDX_Y      1
-#define IDX_SELECT 2
-#define IDX_START  3
-#define IDX_UP     4
-#define IDX_DOWN   5
-#define IDX_LEFT   6
-#define IDX_RIGHT  7
-#define IDX_A      8
-#define IDX_X      9
-#define IDX_L      10
-#define IDX_R      11
-
-    /* SELECT: toggle panel mode */
+static void UpdateAltairInputs(uint32_t cur)
+{
+    /* SELECT: ALTAIR -> Space Invaders */
     if (just_pressed(cur, prev_buttons, IDX_SELECT)) {
-        panel_mode = (panel_mode == MODE_ALTAIR) ? MODE_SI : MODE_ALTAIR;
+        SetPanelMode(MODE_SI);
+        return;
     }
 
     /* START: RUN / STOP */
     if (just_pressed(cur, prev_buttons, IDX_START)) {
         panel_running = !panel_running;
-        cpu_halted    = false;
+        cpu->halted   = HALT_NONE;      /* RUN resumes after HLT */
         status_leds.run  = panel_running;
         status_leds.wait = !panel_running;
+        status_leds.hlta = false;
     }
 
     if (!panel_running) {
@@ -518,22 +463,24 @@ static void UpdateAltairInputs(void)
         /* B: flip selected switch */
         if (just_pressed(cur, prev_buttons, IDX_B)) {
             if (cursor_on_addr)
-                sw_addr ^= (1u << cursor_addr);
+                sw_addr ^= (uint16_t)(1u << cursor_addr);
             else
-                sw_data ^= (1u << cursor_data);
+                sw_data ^= (uint8_t)(1u << cursor_data);
         }
 
-        /* X: EXAMINE – show memory[sw_addr] on data LEDs */
+        /* X: EXAMINE – PC = address switches, show memory[PC] */
         if (just_pressed(cur, prev_buttons, IDX_X)) {
+            cpu->pc  = sw_addr;
             led_addr = sw_addr;
-            led_data = cpu->memory[sw_addr & 0xFFFF];   /* FIX: always mask */
+            led_data = cpu->memory[sw_addr];
             status_leds.memr = true;
             status_leds.wait = true;
         }
 
         /* L1: EXAMINE NEXT */
         if (just_pressed(cur, prev_buttons, IDX_L)) {
-            sw_addr  = (sw_addr + 1) & 0xFFFF;
+            sw_addr  = (uint16_t)(sw_addr + 1);
+            cpu->pc  = sw_addr;
             led_addr = sw_addr;
             led_data = cpu->memory[sw_addr];
             status_leds.memr = true;
@@ -542,7 +489,8 @@ static void UpdateAltairInputs(void)
 
         /* A: DEPOSIT – write sw_data → memory[sw_addr] */
         if (just_pressed(cur, prev_buttons, IDX_A)) {
-            cpu->memory[sw_addr & 0xFFFF] = sw_data;   /* FIX: always mask */
+            cpu->memory[sw_addr] = sw_data;
+            cpu->pc  = sw_addr;
             led_addr = sw_addr;
             led_data = sw_data;
             status_leds.wO   = true;
@@ -551,48 +499,75 @@ static void UpdateAltairInputs(void)
 
         /* Y: DEPOSIT NEXT */
         if (just_pressed(cur, prev_buttons, IDX_Y)) {
-            sw_addr = (sw_addr + 1) & 0xFFFF;
+            sw_addr = (uint16_t)(sw_addr + 1);
             cpu->memory[sw_addr] = sw_data;
+            cpu->pc  = sw_addr;
             led_addr = sw_addr;
             led_data = sw_data;
             status_leds.wO   = true;
             status_leds.wait = true;
         }
 
-        /* R1: RESET – jump to address on switches */
+        /* R1: RESET – PC = 0, SP = default, clear halt */
         if (just_pressed(cur, prev_buttons, IDX_R)) {
-            cpu->pc         = sw_addr;
+            cpu->pc         = 0;
             cpu->sp         = (uint16_t)opt_stack_addr;
             cpu->int_enable = 0;
-            cpu_halted      = false;
-            jmp_active      = false;   /* FIX: clear crash guard on user reset */
+            cpu->halted     = HALT_NONE;
             led_addr = cpu->pc;
-            led_data = cpu->memory[cpu->pc & 0xFFFF];
+            led_data = cpu->memory[cpu->pc];
             status_leds.run  = false;
+            status_leds.hlta = false;
             status_leds.wait = true;
         }
     }
+}
 
+static void UpdateSIInputs(uint32_t cur)
+{
+    /* L + R + SELECT: back to the Altair front panel */
+    if ((cur & (1u << IDX_L)) && (cur & (1u << IDX_R)) &&
+        just_pressed(cur, prev_buttons, IDX_SELECT)) {
+        SetPanelMode(MODE_ALTAIR);
+        return;
+    }
+
+    si_port1 = 0;
+    if (cur & (1u << IDX_SELECT)) si_port1 |= (1 << 0);   /* coin     */
+    if (cur & (1u << IDX_START))  si_port1 |= (1 << 2);   /* 1P start */
+    if ((cur & (1u << IDX_A)) || (cur & (1u << IDX_B)))
+                                  si_port1 |= (1 << 4);   /* fire     */
+    if (cur & (1u << IDX_LEFT))   si_port1 |= (1 << 5);
+    if (cur & (1u << IDX_RIGHT))  si_port1 |= (1 << 6);
+}
+
+static void UpdateInputs(void)
+{
+    if (!poll_cb || !input_cb || !cpu) return;
+    poll_cb();
+
+    uint32_t cur = ReadButtons();
+    if (panel_mode == MODE_SI)
+        UpdateSIInputs(cur);
+    else
+        UpdateAltairInputs(cur);
     prev_buttons = cur;
 }
 
-static void UpdateSIInputs(void)
+/* Keyboard -> serial terminal input (88-SIO RX) */
+static void KeyboardEvent(bool down, unsigned keycode, uint32_t character, uint16_t mods)
 {
-    if (!poll_cb || !input_cb) return;
-    poll_cb();
+    (void)mods;
+    if (!down || panel_mode != MODE_ALTAIR) return;
 
-    si_port1 = 0;
-    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT))
-        si_port1 |= (1 << 0);
-    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
-        si_port1 |= (1 << 2);
-    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A) ||
-        input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
-        si_port1 |= (1 << 4);
-    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))
-        si_port1 |= (1 << 5);
-    if (input_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT))
-        si_port1 |= (1 << 6);
+    if (keycode == RETROK_RETURN || keycode == RETROK_KP_ENTER)
+        term_push_in('\r');
+    else if (keycode == RETROK_BACKSPACE)
+        term_push_in(0x08);
+    else if (keycode == RETROK_TAB)
+        term_push_in('\t');
+    else if (character >= 0x20 && character < 0x7F)
+        term_push_in((uint8_t)character);
 }
 
 /* =============================================================
@@ -676,12 +651,40 @@ static const uint8_t font3x5[128][5] = {
     [':'] = {0x00,0x02,0x00,0x02,0x00},
     ['-'] = {0x00,0x00,0x07,0x00,0x00},
     ['>'] = {0x04,0x02,0x01,0x02,0x04},
+    ['G'] = {0x07,0x04,0x05,0x05,0x07},
+    ['J'] = {0x01,0x01,0x01,0x05,0x07},
+    ['K'] = {0x05,0x05,0x06,0x05,0x05},
+    ['Q'] = {0x07,0x05,0x05,0x07,0x01},
+    ['V'] = {0x05,0x05,0x05,0x05,0x02},
+    ['Y'] = {0x05,0x05,0x02,0x02,0x02},
+    ['Z'] = {0x07,0x01,0x02,0x04,0x07},
+    ['.'] = {0x00,0x00,0x00,0x00,0x02},
+    [','] = {0x00,0x00,0x00,0x02,0x04},
+    ['/'] = {0x01,0x01,0x02,0x04,0x04},
+    ['('] = {0x01,0x02,0x02,0x02,0x01},
+    [')'] = {0x04,0x02,0x02,0x02,0x04},
+    ['='] = {0x00,0x07,0x00,0x07,0x00},
+    ['+'] = {0x00,0x02,0x07,0x02,0x00},
+    ['*'] = {0x05,0x02,0x07,0x02,0x05},
+    ['!'] = {0x02,0x02,0x02,0x00,0x02},
+    ['?'] = {0x07,0x01,0x03,0x00,0x02},
+    ['_'] = {0x00,0x00,0x00,0x00,0x07},
+    ['<'] = {0x01,0x02,0x04,0x02,0x01},
+    ['['] = {0x03,0x02,0x02,0x02,0x03},
+    [']'] = {0x06,0x02,0x02,0x02,0x06},
+    ['%'] = {0x05,0x01,0x02,0x04,0x05},
+    ['#'] = {0x05,0x07,0x05,0x07,0x05},
+    [';'] = {0x00,0x02,0x00,0x02,0x04},
+    ['\''] = {0x02,0x02,0x00,0x00,0x00},
+    ['"'] = {0x05,0x05,0x00,0x00,0x00},
+    ['$'] = {0x03,0x06,0x02,0x03,0x06},
 };
 
 /* FIX: DrawChar guards unknown characters */
 static void DrawChar(int x, int y, char c, uint32_t col, int scale)
 {
     unsigned char uc = (unsigned char)c;
+    if (uc >= 'a' && uc <= 'z') uc = (unsigned char)(uc - 'a' + 'A');   /* font is upper-case only */
     if (uc >= 128) return;
     const uint8_t *glyph = font3x5[uc];
     /* Skip if glyph is all zeros (undefined character) */
@@ -751,11 +754,20 @@ static void term_scroll(void)
 
 static void term_put_char(uint8_t c)
 {
-    if (c == '\n' || c == '\r') {
+    c &= 0x7F;   /* serial data may carry a parity bit */
+    if (c == '\r') {            /* CR: carriage return only */
+        term_cur_col = 0;
+        return;
+    }
+    if (c == '\n') {            /* LF: next line (column reset, many programs send LF only) */
         term_cur_col = 0;
         term_cur_row++;
         if (term_cur_row >= TERM_ROWS)
             term_scroll();
+        return;
+    }
+    if (c == '\t') {
+        do { term_put_char(' '); } while (term_cur_col % 8 && term_cur_col != 0);
         return;
     }
     if (c == '\b') {
@@ -848,13 +860,14 @@ static void RenderAltairPanel(void)
 
     /* === Address LEDs (A15–A0) ===
        FIX: use a fixed spacing that fits 16 LEDs within FB_W-20 pixels.
-       Spacing = (FB_W - 20 - 14) / 16 = 47 px → max x = 14 + 15*47 = 719 ✓ */
+       Spacing 44 px → last LED at x = 14 + 15*44 = 674 ✓ */
     int led_y = 40;
-    DrawStr(14, led_y, "ADDRESS", COL_TEXT_DIM, 1);
-    DrawStr(14, led_y + 10, "A15                          A0", COL_TEXT_DIM, 1);
-
     const int led_x0      = 14;
-    const int led_spacing = 47;
+    const int led_spacing = 44;   /* 15*44 + 14 + 5 = 679 px: clear of the hex read-out */
+    DrawStr(14, led_y, "ADDRESS", COL_TEXT_DIM, 1);
+    DrawStr(led_x0 - 2, led_y + 10, "A15", COL_TEXT_DIM, 1);
+    DrawStr(led_x0 + 15 * 44 - 4, led_y + 10, "A0", COL_TEXT_DIM, 1);
+
 
     for (int i = 15; i >= 0; i--) {
         int xi = led_x0 + (15 - i) * led_spacing;
@@ -869,7 +882,8 @@ static void RenderAltairPanel(void)
     /* === Data LEDs (D7–D0) === */
     int dled_y = led_y + 50;
     DrawStr(14, dled_y, "DATA", COL_TEXT_DIM, 1);
-    DrawStr(14, dled_y + 10, "D7                D0", COL_TEXT_DIM, 1);
+    DrawStr(led_x0 - 2, dled_y + 10, "D7", COL_TEXT_DIM, 1);
+    DrawStr(led_x0 + 7 * 44 - 4, dled_y + 10, "D0", COL_TEXT_DIM, 1);
 
     for (int i = 7; i >= 0; i--) {
         int xi = led_x0 + (7 - i) * led_spacing;
@@ -979,33 +993,31 @@ static void RenderAltairPanel(void)
     RenderTerminal(300);
 }
 
-/* Space Invaders VRAM renderer – FIX: bounds-checked VRAM access */
+/* Space Invaders VRAM renderer.
+   VRAM is 0x2400..0x3FFF: 256 rows x 224 columns stored ROTATED 90 degrees
+   (32 bytes per column, bit 0 = bottom pixel of the byte's 8-pixel run).
+   The image is rotated back and scaled to fill the 480-line frame. */
+#define SI_W        224
+#define SI_H        256
+#define SI_VRAM     0x2400
+#define SI_DRAW_H   FB_H
+#define SI_DRAW_W   (SI_W * SI_DRAW_H / SI_H)      /* 420 */
+#define SI_X0       ((FB_W - SI_DRAW_W) / 2)
+
 static void RenderSI(void)
 {
     if (!cpu) return;
-    /* Original VRAM starts at 0x2400, size = 256*256/8 = 8192 bytes.
-       Ensure we never read past end of 64KB RAM. */
-    const int vram_start = 0x2400;
-    const int vram_size  = 256 * 256 / 8;
-    /* FIX: clamp vram_size to available memory */
-    const int safe_size  = (vram_start + vram_size <= 0x10000)
-                           ? vram_size
-                           : (0x10000 - vram_start);
 
-    for (int i = 0; i < safe_size; i++) {
-        uint8_t byte = cpu->memory[vram_start + i];
-        int px_base = i * 8;
-        for (int bit = 0; bit < 8; bit++) {
-            int px = px_base + bit;
-            int sx = px % 256;
-            int sy = px / 256;
-            int dx = sx * 3;
-            int dy = sy * 480 / 256;
-            if (dy >= FB_H || dx + 2 >= FB_W) continue;   /* FIX: skip OOB pixels */
-            uint32_t col = (byte & (1 << bit)) ? 0xFFFFFFFF : 0xFF000000;
-            frame_buf[dy * FB_W + dx]     = col;
-            frame_buf[dy * FB_W + dx + 1] = col;
-            frame_buf[dy * FB_W + dx + 2] = col;
+    for (int dy = 0; dy < SI_DRAW_H; dy++) {
+        int sy    = dy * SI_H / SI_DRAW_H;           /* 0..255, top -> bottom */
+        int yrot  = (SI_H - 1) - sy;                 /* position inside the column */
+        int boff  = yrot >> 3;
+        int bmask = 1 << (yrot & 7);
+        uint32_t *dst = &frame_buf[dy * FB_W + SI_X0];
+        for (int dx = 0; dx < SI_DRAW_W; dx++) {
+            int sx = dx * SI_W / SI_DRAW_W;          /* 0..223 */
+            uint8_t byte = cpu->memory[SI_VRAM + sx * 32 + boff];
+            dst[dx] = (byte & bmask) ? 0xFFFFFFFF : 0xFF000000;
         }
     }
 }
@@ -1033,8 +1045,13 @@ void retro_set_environment(retro_environment_t cb)
     if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging))
         log_cb = logging.log;
 
-    bool no_rom = false;
-    cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_rom);
+    /* The front panel is usable without any content */
+    bool support_no_game = true;
+    cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &support_no_game);
+
+    /* Keyboard -> serial terminal */
+    struct retro_keyboard_callback kb = { KeyboardEvent };
+    cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kb);
 
     /* Register core options */
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)core_options);
@@ -1051,9 +1068,11 @@ void retro_set_input_state(retro_input_state_t cb)                 { input_cb   
 
 void retro_init(void)
 {
-    cpu        = Init8080();
-    cpu_halted = false;
-    jmp_active = false;   /* FIX: explicit init */
+    cpu = Init8080();
+    if (cpu) {
+        cpu->io_in  = MachineIN;
+        cpu->io_out = MachineOUT;
+    }
     memset(term_screen, ' ', sizeof(term_screen));
     memset(&status_leds, 0, sizeof(status_leds));
     status_leds.wait = true;
@@ -1061,12 +1080,8 @@ void retro_init(void)
 
 void retro_deinit(void)
 {
-    jmp_active = false;   /* FIX: disarm crash guard before freeing CPU */
-    if (cpu) {
-        free(cpu->memory);
-        free(cpu);
-        cpu = NULL;
-    }
+    Free8080(cpu);
+    cpu = NULL;
 }
 
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
@@ -1094,8 +1109,10 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 
 bool retro_load_game(const struct retro_game_info *game)
 {
-    if (!cpu) cpu = Init8080();
-    /* FIX: if Init8080 failed (OOM), bail cleanly */
+    if (!cpu) {
+        cpu = Init8080();
+        if (cpu) { cpu->io_in = MachineIN; cpu->io_out = MachineOUT; }
+    }
     if (!cpu) {
         if (log_cb)
             log_cb(RETRO_LOG_ERROR, "[altair8800] Init8080() failed – out of memory\n");
@@ -1106,8 +1123,7 @@ bool retro_load_game(const struct retro_game_info *game)
     cpu->pc         = 0;
     cpu->sp         = (uint16_t)opt_stack_addr;   /* FIX: use option, not hardcoded 0xF000 */
     cpu->int_enable = 0;
-    cpu_halted      = false;
-    jmp_active      = false;
+    cpu->halted     = HALT_NONE;
     panel_running   = false;
 
     sw_addr = 0; sw_data = 0;
@@ -1129,14 +1145,16 @@ bool retro_load_game(const struct retro_game_info *game)
         memcpy(cpu->memory, game->data, sz);
     }
 
-    /* Apply current options */
+    /* Apply current options (fresh load: honour the panel-mode option as-is) */
     if (env_cb) ApplyCoreOptions(env_cb);
+    panel_mode    = opt_panel_mode;
+    panel_running = (panel_mode == MODE_SI);
 
     /* Re-apply stack pointer after option parsing */
     cpu->sp = (uint16_t)opt_stack_addr;
 
-    /* Auto-run if option enabled */
-    if (opt_autorun) {
+    /* Auto-run if option enabled (Altair panel) */
+    if (opt_autorun && panel_mode == MODE_ALTAIR) {
         panel_running = true;
         status_leds.run  = true;
         status_leds.wait = false;
@@ -1155,24 +1173,20 @@ void retro_run(void)
     if (env_cb && env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
         ApplyCoreOptions(env_cb);
 
-    if (panel_mode == MODE_SI) {
-        UpdateSIInputs();
-    } else {
-        UpdateAltairInputs();
-    }
+    UpdateInputs();
 
     /* First CPU half */
     RunCycles(CYCLES_PER_HALF);
 
-    /* Mid-frame interrupt (RST 1) – used by Space Invaders */
-    if (cpu && !cpu_halted && panel_running && cpu->int_enable)
+    /* Mid-frame interrupt (RST 1) – Space Invaders hardware only */
+    if (cpu && panel_mode == MODE_SI && panel_running && cpu->int_enable)
         GenInterrupt(cpu, 1);
 
     /* Second CPU half */
     RunCycles(CYCLES_PER_HALF);
 
-    /* VBlank interrupt (RST 2) */
-    if (cpu && !cpu_halted && panel_running && cpu->int_enable)
+    /* VBlank interrupt (RST 2) – Space Invaders hardware only */
+    if (cpu && panel_mode == MODE_SI && panel_running && cpu->int_enable)
         GenInterrupt(cpu, 2);
 
     RenderFrame();
@@ -1184,11 +1198,10 @@ void retro_run(void)
 
 void retro_unload_game(void)
 {
-    jmp_active = false;   /* FIX: disarm before clearing state */
     if (cpu) {
         memset(cpu->memory, 0, 0x10000);
-        cpu->pc    = 0;
-        cpu_halted = false;
+        cpu->pc     = 0;
+        cpu->halted = HALT_NONE;
         panel_running = false;
     }
 }
@@ -1199,10 +1212,10 @@ void retro_reset(void)
         cpu->pc         = 0;
         cpu->sp         = (uint16_t)opt_stack_addr;  /* FIX: use current option */
         cpu->int_enable = 0;
-        cpu_halted      = false;
-        jmp_active      = false;   /* FIX: clear crash guard on hard reset */
-        panel_running   = false;
+        cpu->halted     = HALT_NONE;
+        panel_running   = (panel_mode == MODE_SI);
         led_addr = 0; led_data = 0;
+        prev_buttons = 0;
         si_port1 = 0; si_port2 = 0;
         shift_reg = 0; shift_amount = 0;
         beeper_on = false;
@@ -1236,7 +1249,8 @@ typedef struct {
     uint8_t  shift_amount;
     uint8_t  si_port1;
     uint8_t  si_port2;
-    uint8_t  _pad[2];   /* align to 4 bytes */
+    uint8_t  cpu_hlt;   /* cpu->halted (was padding: size unchanged) */
+    uint8_t  _pad;
     /* 64 KB RAM follows immediately */
 } SaveBlock;
 
@@ -1272,7 +1286,8 @@ bool retro_serialize(void *data, size_t size)
     blk->led_addr       = led_addr;
     blk->led_data       = led_data;
     blk->panel_running  = (uint8_t)panel_running;
-    blk->cpu_halted     = (uint8_t)cpu_halted;
+    blk->cpu_halted     = (uint8_t)(cpu->halted != 0);
+    blk->cpu_hlt        = cpu->halted;
     blk->shift_reg      = shift_reg;
     blk->shift_amount   = shift_amount;
     blk->si_port1       = si_port1;
@@ -1308,8 +1323,7 @@ bool retro_unserialize(const void *data, size_t size)
     led_addr        = blk->led_addr;
     led_data        = blk->led_data;
     panel_running   = (bool)blk->panel_running;
-    cpu_halted      = (bool)blk->cpu_halted;
-    jmp_active      = false;   /* FIX: never restore jmp_active from state */
+    cpu->halted     = blk->cpu_hlt ? blk->cpu_hlt : (blk->cpu_halted ? HALT_HLT : HALT_NONE);
     shift_reg       = blk->shift_reg;
     shift_amount    = blk->shift_amount;
     si_port1        = blk->si_port1;
@@ -1320,20 +1334,18 @@ bool retro_unserialize(const void *data, size_t size)
 }
 
 /* =============================================================
-   Expose terminal output as SAVE_RAM so frontends can read it
+   Memory map (system RAM only – no SAVE_RAM, so no stray .srm files)
    ============================================================= */
 void *retro_get_memory_data(unsigned id)
 {
     if (!cpu) return NULL;
     if (id == RETRO_MEMORY_SYSTEM_RAM) return cpu->memory;
-    if (id == RETRO_MEMORY_SAVE_RAM)   return term_out_buf;
     return NULL;
 }
 
 size_t retro_get_memory_size(unsigned id)
 {
     if (id == RETRO_MEMORY_SYSTEM_RAM) return 0x10000;
-    if (id == RETRO_MEMORY_SAVE_RAM)   return TERM_BUF;
     return 0;
 }
 

@@ -1,20 +1,38 @@
 TARGET_NAME = altair8800
 CC         ?= gcc
-CFLAGS      = -fPIC -O2 -Wall -std=c99
+CFLAGS     ?= -O2
+CFLAGS     += -Wall -std=c99
 OBJECTS     = libretro.o i8080.o
 
-all: $(TARGET_NAME)_libretro.so
+# ---- platform detection ----
+ifeq ($(OS),Windows_NT)
+   EXT      = dll
+   LDFLAGS += -shared -static-libgcc
+   CFLAGS  += -U_FORTIFY_SOURCE
+else
+   UNAME := $(shell uname -s)
+   ifeq ($(UNAME),Darwin)
+      EXT      = dylib
+      CFLAGS  += -fPIC
+      LDFLAGS += -dynamiclib
+   else
+      EXT      = so
+      CFLAGS  += -fPIC
+      LDFLAGS += -shared
+   endif
+endif
 
-$(TARGET_NAME)_libretro.so: $(OBJECTS)
-	$(CC) -shared -fPIC -o $@ $^ -lm
+TARGET = $(TARGET_NAME)_libretro.$(EXT)
 
-libretro.o: libretro.c
-	$(CC) $(CFLAGS) -c -o $@ $
+all: $(TARGET)
 
-i8080.o: i8080.c
-	$(CC) $(CFLAGS) -c -o $@ $
+$(TARGET): $(OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ -lm
+
+%.o: %.c i8080.h libretro.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJECTS) $(TARGET_NAME)_libretro.so
+	rm -f $(OBJECTS) $(TARGET)
 
 .PHONY: all clean
