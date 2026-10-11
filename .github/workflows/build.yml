@@ -1,8 +1,8 @@
 name: build
 on: [push, pull_request]
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -19,7 +19,7 @@ jobs:
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: deps (linux)
         if: matrix.platform == 'linux'
@@ -31,7 +31,7 @@ jobs:
         if: matrix.platform == 'windows'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64
+          sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - name: build (linux)
         if: matrix.platform == 'linux'
@@ -55,15 +55,16 @@ jobs:
           cc -fPIC -O2 -Wall -std=c99 -arch x86_64 -c -o i8080_x86.o i8080.c
           cc -fPIC -O2 -Wall -std=c99 -arch arm64  -c -o libretro_arm.o libretro.c
           cc -fPIC -O2 -Wall -std=c99 -arch arm64  -c -o i8080_arm.o i8080.c
-          cc -dynamiclib -fPIC -arch x86_64 -o altair8800_libretro_x86.dylib libretro_x86.o i8080_x86.o -lm
-          cc -dynamiclib -fPIC -arch arm64  -o altair8800_libretro_arm.dylib libretro_arm.o i8080_arm.o -lm
+          cc -dynamiclib -arch x86_64 -o altair8800_libretro_x86.dylib libretro_x86.o i8080_x86.o -lm
+          cc -dynamiclib -arch arm64  -o altair8800_libretro_arm.dylib libretro_arm.o i8080_arm.o -lm
           lipo -create -output altair8800_libretro.dylib altair8800_libretro_x86.dylib altair8800_libretro_arm.dylib
 
       - name: upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-${{ matrix.platform }}
+          if-no-files-found: error
           path: |
-            *.so
-            *.dll
-            *.dylib
+            altair8800_libretro.so
+            altair8800_libretro.dll
+            altair8800_libretro.dylib
